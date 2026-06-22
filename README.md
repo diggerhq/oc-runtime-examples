@@ -1,71 +1,80 @@
 # OpenComputer runtime examples
 
-A **runtime** is the engine that runs an OpenComputer [Durable Agent Session](https://docs.opencomputer.dev/agent-sessions/runtimes). This repo shows what a runtime actually is: **a thin wrapper around a provider's agent SDK** that speaks a small contract with the platform.
+A **runtime** is the engine that runs an OpenComputer [Durable Agent Session](https://docs.opencomputer.dev/agent-sessions/runtimes): it drives a model's agent loop for one turn and records every step in the session's durable log. A runtime is a thin **wrapper around a provider's agent SDK** that adheres to the operational contract below.
 
-Two runtimes, built the same way:
+Two worked examples, built the same way:
 
-| Directory | Wraps | Models |
-| --- | --- | --- |
-| [`runtimes/claude`](runtimes/claude) | Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) | `anthropic/…` |
-| [`runtimes/codex`](runtimes/codex) | OpenAI Codex SDK (`@openai/codex-sdk`) | `openai/…` |
+- [**`claude/`**](claude) — wraps the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`).
+- [**`codex/`**](codex) — wraps the OpenAI Codex SDK (`@openai/codex-sdk`).
 
-They mirror how the built-in `claude` and `codex` runtimes are implemented.
+They mirror how the built-in `claude` and `codex` runtimes are implemented. Inside each, the platform-facing files — `context.ts`, `session.ts`, `sandbox.ts`, `index.ts` — are **byte-identical** across both runtimes; only the SDK-specific files (`agent.ts`, `tools.ts`, `prompt.ts`) differ. That contrast is the point: writing a runtime is wrapping an SDK, not re-implementing the platform.
 
-## The point: a runtime is an SDK wrapper
+---
 
-Each runtime is three small files:
+## The operational contract
 
-- **`src/oc.ts`** — the platform substrate: read events, append events, call the remote sandbox. **This file is identical in both runtimes** — the contract between OpenComputer and a runtime doesn't depend on the model. (`diff runtimes/claude/src/oc.ts runtimes/codex/src/oc.ts` is empty.)
-- **`src/index.ts`** — drives the provider's agent SDK for one turn and translates its output into session events. This is the only file that meaningfully differs between the two.
-- **`src/oc-tools.ts`** — the agent's tools (`bash` / `read` / `write` / `ls` / `say` / `ask`), each calling the remote sandbox.
+Every runtime adheres to this contract, whatever SDK it wraps.
 
-Swap the SDK in `index.ts` + `oc-tools.ts`, keep `oc.ts`, and you have a new runtime.
+### Invocation — once per turn
 
-## The contract
+The platform runs the runtime **once per turn** (`node dist/index.js`): the process drives a single turn and exits. It is not a long-running server. See [`index.ts`](claude/src/index.ts) for the whole lifecycle on one screen.
 
-The platform invokes a runtime **once per turn** and hands it everything through the environment:
+### Inputs — the environment
 
-| Env | Meaning |
+Everything the runtime needs for a turn arrives in the environment ([`context.ts`](claude/src/context.ts)):
+
+| Variable | Meaning |
 | --- | --- |
-| `OC_API_URL` | base URL of the session events API |
-| `OC_SESSION_ID` | the session this turn belongs to |
-| `OC_TURN_ID` | this turn's id (used to build idempotent append keys) |
-| `OC_TURN_TOKEN` | fenced, single-use auth for this turn — the only plaintext credential the runtime holds |
-| `OC_EVENTS_CURSOR` | read watermark: events at or before this seq are already consumed |
-| `OC_EVENT_KEY_BASE` | durable high-water for append idempotency keys |
-| `OC_AGENT_PROMPT` | the agent's system prompt |
-| `OC_MODEL` | the `provider/model` to run |
-| `OC_RUNTIME_STATE_DIR` | a checkpointed directory for resumable state |
-| `<PROVIDER>_API_KEY` | the model key — **sealed**: an opaque token the host egress proxy swaps for the real key on the call to the provider. It never enters the VM in plaintext. |
+| `OC_API_URL` | Base URL of the session events API. |
+| `OC_SESSION_ID` | The session this turn belongs to. |
+| `OC_TURN_ID` | This turn's id (used to build idempotent append keys). |
+| `OC_TURN_TOKEN` | Fenced, single-use auth for this turn — the only plaintext credential the runtime holds. |
+| `OC_EVENTS_CURSOR` | Read watermark: events at or before this seq are already consumed. |
+| `OC_EVENT_KEY_BASE` | Durable high-water seed for append idempotency keys. |
+| `OC_AGENT_PROMPT` | The agent's system prompt. |
+| `OC_MODEL` | The `provider/model` to run. |
+| `OC_RUNTIME_STATE_DIR` | A checkpointed directory for resumable state. |
+| `<PROVIDER>_API_KEY` | The model key, **sealed**: an opaque token the host egress proxy swaps for the real key on the outbound call to the provider. It never enters the VM in plaintext. |
 
-For one turn, the runtime:
+### The turn
 
-1. reads new input from the events API at `OC_EVENTS_CURSOR`;
-2. drives its SDK's agent loop;
-3. appends each step back as typed events (`agent.message`, `tool.call`, `exec.completed`, `agent.result`, `error.*`, …);
-4. performs side effects only through the remote **hands sandbox** (`POST /v3/sessions/:id/sandbox/{exec,read,write,ls}`);
-5. **exits `0`** when there's nothing left to do. A non-zero exit is treated as a crash and the platform restarts the turn in place.
+1. **Read new input** from the events API at `OC_EVENTS_CURSOR` — `GET /v3/sessions/:id/events?after=<cursor>` ([`session.ts`](claude/src/session.ts)).
+2. **Drive the agent SDK** for one turn ([`agent.ts`](claude/src/agent.ts)).
+3. **Append each step** back — `POST /v3/sessions/:id/events` — as a typed event: `agent.message`, `tool.call`, `exec.completed`, `agent.result`, `error.*`. Each append carries a stable idempotency key (`rt:<turn>:<base+n>`), so a restart never double-writes.
+4. **Run side effects only in the remote sandbox** — `POST /v3/sessions/:id/sandbox/{exec,read,write,ls}` ([`sandbox.ts`](claude/src/sandbox.ts)). The runtime has no local disk, shell, or network.
+5. **Talk to the human** through the `say` and `ask` tools (user-level events); `ask` ends the turn awaiting a reply.
 
-The platform owns everything else: the durable event log, fencing a single writer, hibernation, crash/restart, and recovery. The runtime stays stateless between turns except for what it leaves under `OC_RUNTIME_STATE_DIR`.
+### Event levels
 
-### Resumable state — the model-specific part
+Every appended event carries a `level`: `user` (shown to the human), `progress` (activity feed), or `internal` (operator/debug).
 
-Both runtimes keep resumable state under `OC_RUNTIME_STATE_DIR`, but in the shape their SDK wants:
+### Output — the exit code is the lifecycle
 
-- **claude** keeps the Agent SDK's journal there and `--continue`s it on the next turn.
-- **codex** persists the **Codex thread id** there and `resumeThread()`s it — the conversation lives server-side, keyed by that id.
+- **Exit 0** — quiescent: nothing left to do. The session goes idle until the next message.
+- **Non-zero** — crash: the platform restarts the turn in place from the checkpointed state.
+- A **`401`** from the events API means the turn was **fenced** (canceled, or superseded by a newer one). Stop quietly and exit 0; the platform owns what happens next. Fencing guarantees a single writer, so the log never forks.
+
+### Resumable state
+
+Anything needed to resume goes under `OC_RUNTIME_STATE_DIR`, which the platform checkpoints at each turn boundary and restores on recovery. Its shape is up to the SDK: `claude` keeps a journal it `--continue`s; `codex` persists a server-side thread id it `resumeThread()`s.
+
+### What the platform owns
+
+The durable event log, single-writer fencing, hibernation, crash/restart, recovery, and delivery. The runtime stays stateless between turns except for `OC_RUNTIME_STATE_DIR`.
+
+---
 
 ## Build
 
 Each runtime is a standalone package:
 
 ```bash
-cd runtimes/claude   # or runtimes/codex
+cd claude   # or codex
 npm install
-npm run build        # tsc → dist/
-npm start            # runs one turn from the OC_* environment
+npm run build
+npm start
 ```
 
 ## Status
 
-These are **reference implementations** to show the shape — registering your own custom runtime image is on the OpenComputer roadmap (see [Custom runtimes](https://docs.opencomputer.dev/agent-sessions/custom-runtimes)). The `claude` example tracks the production `claude` runtime closely. The `codex` example tracks the public `@openai/codex-sdk`; the exact streamed-item shapes and the tool-registration call are marked in the code where they converge with the production `codex` runtime.
+These are reference implementations of the contract. Registering your own custom runtime image is on the OpenComputer roadmap — see [Custom runtimes](https://docs.opencomputer.dev/agent-sessions/custom-runtimes). The `claude` example tracks the production `claude` runtime closely; the `codex` example tracks the public `@openai/codex-sdk`, with the two converging spots marked in [`codex/`](codex).
