@@ -2,12 +2,12 @@
 
 A **runtime** is the engine that runs an OpenComputer [Durable Agent Session](https://docs.opencomputer.dev/agent-sessions/runtimes): it drives a model's agent loop for one turn and records every step in the session's durable log. A runtime is a thin **wrapper around a provider's agent SDK** that adheres to the operational contract below.
 
-Two worked examples, built the same way:
+Two worked examples, each a single file:
 
-- [**`claude/`**](claude) — wraps the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`).
-- [**`codex/`**](codex) — wraps the OpenAI Codex SDK (`@openai/codex-sdk`).
+- [**`claude/src/index.ts`**](claude/src/index.ts) — wraps the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`).
+- [**`codex/src/index.ts`**](codex/src/index.ts) — wraps the OpenAI Codex SDK (`@openai/codex-sdk`).
 
-They mirror how the built-in `claude` and `codex` runtimes are implemented. Inside each, the platform-facing files — `context.ts`, `session.ts`, `sandbox.ts`, `index.ts` — are **byte-identical** across both runtimes; only the SDK-specific files (`agent.ts`, `tools.ts`, `prompt.ts`) differ. That contrast is the point: writing a runtime is wrapping an SDK, not re-implementing the platform.
+Each file reads top to bottom: the **turn** (`main`), then the **platform contract** (`newInput` / `append` / `sandbox`), then the **tools**. The contract helpers are the same in both runtimes — only `main` and the tool registration are SDK-specific. That contrast is the point: writing a runtime is wrapping an SDK, not re-implementing the platform.
 
 ---
 
@@ -17,11 +17,11 @@ Every runtime adheres to this contract, whatever SDK it wraps.
 
 ### Invocation — once per turn
 
-The platform runs the runtime **once per turn** (`node dist/index.js`): the process drives a single turn and exits. It is not a long-running server. See [`index.ts`](claude/src/index.ts) for the whole lifecycle on one screen.
+The platform runs the runtime **once per turn** (`node dist/index.js`): the process drives a single turn and exits. It is not a long-running server.
 
 ### Inputs — the environment
 
-Everything the runtime needs for a turn arrives in the environment ([`context.ts`](claude/src/context.ts)):
+Everything the runtime needs for a turn arrives in the environment:
 
 | Variable | Meaning |
 | --- | --- |
@@ -38,10 +38,10 @@ Everything the runtime needs for a turn arrives in the environment ([`context.ts
 
 ### The turn
 
-1. **Read new input** from the events API at `OC_EVENTS_CURSOR` — `GET /v3/sessions/:id/events?after=<cursor>` ([`session.ts`](claude/src/session.ts)).
-2. **Drive the agent SDK** for one turn ([`agent.ts`](claude/src/agent.ts)).
-3. **Append each step** back — `POST /v3/sessions/:id/events` — as a typed event: `agent.message`, `tool.call`, `exec.completed`, `agent.result`, `error.*`. Each append carries a stable idempotency key (`rt:<turn>:<base+n>`), so a restart never double-writes.
-4. **Run side effects only in the remote sandbox** — `POST /v3/sessions/:id/sandbox/{exec,read,write,ls}` ([`sandbox.ts`](claude/src/sandbox.ts)). The runtime has no local disk, shell, or network.
+1. **Read new input** from the events API at `OC_EVENTS_CURSOR` — `GET /v3/sessions/:id/events?after=<cursor>`.
+2. **Drive the agent SDK** for one turn.
+3. **Append each step** back — `POST /v3/sessions/:id/events` — as a typed event: `agent.message`, `tool.call`, `exec.completed`, `error.*`. Each append carries a stable idempotency key (`rt:<turn>:<base+n>`), so a restart never double-writes.
+4. **Run side effects only in the remote sandbox** — `POST /v3/sessions/:id/sandbox/{exec,read,write,ls}`. The runtime has no local disk, shell, or network.
 5. **Talk to the human** through the `say` and `ask` tools (user-level events); `ask` ends the turn awaiting a reply.
 
 ### Event levels
@@ -77,4 +77,4 @@ npm start
 
 ## Status
 
-These are reference implementations of the contract. Registering your own custom runtime image is on the OpenComputer roadmap — see [Custom runtimes](https://docs.opencomputer.dev/agent-sessions/custom-runtimes). The `claude` example tracks the production `claude` runtime closely; the `codex` example tracks the public `@openai/codex-sdk`, with the two converging spots marked in [`codex/`](codex).
+These are reference implementations of the contract. Registering your own custom runtime image is on the OpenComputer roadmap — see [Custom runtimes](https://docs.opencomputer.dev/agent-sessions/custom-runtimes). The `claude` example tracks the production `claude` runtime closely; in `codex`, the tool-registration call and the streamed-item field names are the two spots that converge with the production `codex` runtime (marked in the file).
