@@ -1,102 +1,146 @@
-// codex runtime — one turn of an OpenComputer agent session, wrapping the OpenAI Codex SDK.
+// Codex brain server for OpenComputer runtimes.
 //
-// A runtime is a replaceable "brain". It knows its agent SDK (here, Codex) and the
-// OpenComputer *operational contract* — a handful of HTTP calls + env vars + exit codes,
-// and nothing else. It imports NO OpenComputer library. The contract section below is
-// byte-identical to the claude runtime's: the contract doesn't depend on the model.
+// This mirrors how the built-in `codex` runtime is actually built: an OC-UNAWARE HTTP
+// server wrapping the OpenAI Codex SDK. Same contract as the claude brain (GET /healthz +
+// POST /turn streaming the SDK's NATIVE events as NDJSON); only the SDK wiring differs.
+// The platform ADAPTER (a separate process) owns all OC-awareness.
+//
+// Codex specifics (the parts that make brain/hands separation + resume actually work):
+//   - Tools come from the MCP endpoint, registered via the codex CLI **config**
+//     (`mcp_servers.<name>.url`) — NOT a per-thread `tools` option (the SDK ignores that).
+//   - Codex's BUILT-IN shell is disabled (`features.shell_tool` / `unified_exec` = false) so
+//     it runs everything through the `oc` MCP tools (the hands box), not local exec.
+//   - HTTP/SSE transport is forced (a custom provider with `supports_websockets:false`) so the
+//     host egress proxy can swap the sealed key — the default responses-websocket can't be proxied.
+//   - Resume is a SERVER-SIDE THREAD: persist `thread.id` under state_dir and resume it next turn.
 
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Codex } from "@openai/codex-sdk";
 
-// ---- the OpenComputer operational contract (the entire platform dependency) ----
+const CONTRACT_VERSION = "1";
+const PORT = Number(process.env.OC_BRAIN_PORT ?? "8080");
 
-const API = process.env.OC_API_URL!.replace(/\/$/, "");
-const SESSION = process.env.OC_SESSION_ID!;
-const headers = { "Content-Type": "application/json", "X-Turn-Token": process.env.OC_TURN_TOKEN! };
-let eventKey = Number(process.env.OC_EVENT_KEY_BASE ?? 0);
+const TOOL_STEERING =
+  "Your filesystem and shell are REMOTE — use ONLY the OpenComputer MCP tools (oc): " +
+  "bash (shell), read / write / ls (files). There is no local filesystem. " +
+  "Anything the human should see — progress, findings, and especially your final ANSWER — MUST go through the say tool. " +
+  "Use the ask tool when you need a decision or missing info; after asking, STOP.";
 
-async function readInput(): Promise<string> {
-  const after = process.env.OC_EVENTS_CURSOR ?? "0";
-  const res = await fetch(`${API}/v3/sessions/${SESSION}/events?after=${after}&level=internal`, { headers });
-  const { data = [] } = (await res.json()) as { data: any[] };
-  return data.filter((e) => e.level === "user" && e.type.endsWith(".message")).map((e) => e.body?.text).filter(Boolean).join("\n\n") || "(no new input)";
+interface TurnConfig {
+  model?: string;
+  system_prompt?: string;
+  mcp_endpoint?: string;   // external MCP server (adapter-hosted): the hands + say/ask
+  state_dir?: string;      // checkpointed dir; the codex thread id lives under it
+  deadline_s?: number;
+}
+interface TurnRequest {
+  contract_version?: string;
+  turn_id?: string;
+  input?: Array<{ role?: string; content?: string }>;
+  config?: TurnConfig;
 }
 
-async function emit(type: string, level: "user" | "progress" | "internal", body: unknown) {
-  // Stable per-turn idempotency key, so a crash-restart never double-writes.
-  const res = await fetch(`${API}/v3/sessions/${SESSION}/events`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ type, level, body, idempotency_key: `rt:${process.env.OC_TURN_ID}:${eventKey++}` }),
-  });
-  if (res.status === 401) throw new Error("fenced"); // turn canceled/superseded — stop quietly
-  if (!res.ok) throw new Error(`emit ${type}: ${res.status}`);
+let busy = false;
+
+async function readBody(req: IncomingMessage): Promise<TurnRequest> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+function writeLine(res: ServerResponse, obj: unknown): void {
+  res.write(JSON.stringify(obj) + "\n");
 }
 
-async function sandbox(op: "exec" | "read" | "write" | "ls", body: unknown): Promise<any> {
-  const res = await fetch(`${API}/v3/sessions/${SESSION}/sandbox/${op}`, { method: "POST", headers, body: JSON.stringify(body) });
-  if (!res.ok) throw new Error(`sandbox ${op}: ${res.status}`);
-  return res.json();
-}
+async function runTurn(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (busy) { res.writeHead(409, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { type: "busy", message: "a turn is in flight" } })); return; }
 
-// ---- the agent's tools: file/shell run in the remote sandbox; say/ask reach the human ----
-// Handing this array to the SDK (startThread/resumeThread, below) is the one provider-specific
-// seam — it converges with the production codex runtime.
+  let body: TurnRequest;
+  try { body = await readBody(req); }
+  catch { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { type: "invalid", message: "bad JSON" } })); return; }
 
-let asked = false;
-const schema = (properties: Record<string, unknown>, required: string[] = []) => ({ type: "object", properties, required });
-
-const tools = [
-  {
-    name: "oc_bash",
-    description: "Run a shell command in the remote sandbox — the only place commands run.",
-    parameters: schema({ command: { type: "string" } }, ["command"]),
-    run: async ({ command }: any) => {
-      await emit("tool.call", "progress", { tool: "bash", args_summary: String(command).slice(0, 200) });
-      const { exitCode, stdout, stderr } = await sandbox("exec", { command });
-      await emit("exec.completed", "progress", { command: String(command).slice(0, 200), exit_code: exitCode, summary: (stdout ?? "").slice(0, 400) });
-      return `exit ${exitCode}\n${stdout ?? ""}${stderr ? `\n[stderr]\n${stderr}` : ""}`;
-    },
-  },
-  { name: "oc_read", description: "Read a file from the remote sandbox.", parameters: schema({ path: { type: "string" } }, ["path"]), run: async ({ path }: any) => (await sandbox("read", { path })).content ?? "" },
-  { name: "oc_write", description: "Write a file in the remote sandbox.", parameters: schema({ path: { type: "string" }, content: { type: "string" } }, ["path", "content"]), run: async ({ path, content }: any) => { await sandbox("write", { path, content }); return `wrote ${path}`; } },
-  { name: "oc_ls", description: "List a directory in the remote sandbox.", parameters: schema({ path: { type: "string" } }), run: async ({ path }: any) => JSON.stringify((await sandbox("ls", { path })).entries) },
-  { name: "oc_say", description: "Say something to the human — your findings or final answer. Ordinary text is not shown to them.", parameters: schema({ text: { type: "string" } }, ["text"]), run: async ({ text }: any) => { await emit("agent.message", "user", { text }); return "said"; } },
-  { name: "oc_ask", description: "Ask the human a question and PAUSE the turn until they reply.", parameters: schema({ text: { type: "string" } }, ["text"]), run: async ({ text }: any) => { await emit("agent.message", "user", { text, awaiting_input: true }); asked = true; return "asked"; } },
-];
-
-const STEERING =
-  "Your filesystem and shell are REMOTE — use only the oc_bash / oc_read / oc_write / oc_ls tools. " +
-  "Anything the human should see, especially your final ANSWER, must go through oc_say. " +
-  "Use oc_ask only when you need a decision you cannot safely assume, then stop.";
-
-// ---- the turn: assemble the Codex thread from those pieces and run it ----
-
-async function main() {
-  // Codex resumes by THREAD ID (the conversation lives server-side), not a local journal.
-  const stateDir = process.env.OC_RUNTIME_STATE_DIR ?? `${process.env.HOME}/.oc/state/${SESSION}`;
-  mkdirSync(stateDir, { recursive: true });
-  const threadFile = join(stateDir, "codex-thread-id");
-  const saved = existsSync(threadFile) ? readFileSync(threadFile, "utf8").trim() : "";
-
-  const codex = new Codex({ env: { ...process.env } });
-  const model = (process.env.OC_MODEL || "openai/gpt-5-codex").replace(/^openai\//, "");
-  const thread = saved ? codex.resumeThread(saved, { tools }) : codex.startThread({ model, skipGitRepoCheck: true, tools });
-
-  const { events } = await thread.runStreamed(`${process.env.OC_AGENT_PROMPT ?? ""}\n\n${STEERING}\n\n${await readInput()}`);
-  for await (const ev of events) {
-    if (ev.type === "item.completed" && ev.item?.type === "agent_message" && ev.item.text?.trim()) await emit("agent.message", "progress", { text: ev.item.text });
-    if (asked) break;
+  if (body.contract_version && body.contract_version !== CONTRACT_VERSION) {
+    res.writeHead(426, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "version", message: `brain speaks contract ${CONTRACT_VERSION}` } }));
+    return;
   }
 
-  if (thread.id) writeFileSync(threadFile, thread.id);
+  const cfg = body.config ?? {};
+  const model = (cfg.model ?? "openai/gpt-5-codex").replace(/^openai\//, "");
+  const stateDir = cfg.state_dir ?? join(process.env.HOME ?? "/home/sandbox", ".oc/runtime-state");
+  mkdirSync(stateDir, { recursive: true });
+  const threadFile = join(stateDir, "codex-thread-id");
+  const savedThreadId = existsSync(threadFile) ? readFileSync(threadFile, "utf8").trim() : "";
+
+  const prompt = [
+    cfg.system_prompt ?? "You are a helpful background agent.",
+    TOOL_STEERING,
+    (body.input ?? []).map((m) => `${m.role ?? "user"}: ${m.content ?? ""}`).filter(Boolean).join("\n\n") || "(no new input)",
+  ].filter(Boolean).join("\n\n");
+
+  res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-cache" });
+  busy = true;
+  let seq = 0;
+  let awaiting = false;
+  const ac = new AbortController();
+  req.on("close", () => { if (!res.writableEnded) ac.abort(); });
+
+  try {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+
+    const codex = new Codex({
+      env,
+      config: {
+        // Force HTTP/SSE transport (not the experimental responses-websocket): the sealed-key
+        // egress proxy swaps the key on HTTPS, not on a wss handshake.
+        model_provider: "openai-http",
+        model_providers: {
+          "openai-http": { name: "OpenAI HTTP/SSE", base_url: "https://api.openai.com/v1", env_key: "OPENAI_API_KEY", wire_api: "responses", requires_openai_auth: true, supports_websockets: false },
+        },
+        // Disable codex's native local exec so it MUST use the `oc` hands tools. image_generation
+        // is also off — the fallback model metadata injects it and gpt-5-codex rejects it turn-fatally.
+        features: { shell_tool: false, unified_exec: false, image_generation: false },
+        // Register the adapter-hosted MCP server (auto-approve — there's no human per-tool approval).
+        mcp_servers: cfg.mcp_endpoint ? { oc: { url: cfg.mcp_endpoint, default_tools_approval_mode: "auto" } } : {},
+      },
+    } as never);
+
+    // danger-full-access + approval never: with the native shell gone nothing runs locally, so
+    // codex's local sandbox is moot — but if left restrictive it cancels the remote MCP calls.
+    const threadOpts = { skipGitRepoCheck: true, sandboxMode: "danger-full-access", approvalPolicy: "never" } as never;
+    const thread = savedThreadId
+      ? codex.resumeThread(savedThreadId, threadOpts)
+      : codex.startThread({ model, ...(threadOpts as object) } as never);
+
+    const { events } = await thread.runStreamed(prompt);
+    for await (const event of events) {
+      if (ac.signal.aborted) throw new Error("aborted");
+      // Stream the NATIVE codex event verbatim; the adapter translates + appends durably.
+      writeLine(res, { seq: seq++, kind: (event as { type?: string }).type, msg: event });
+      const e = event as { type?: string; item?: { type?: string; tool?: string; name?: string } };
+      if (e.type === "item.completed" && /(^|[._])ask$/.test(e.item?.tool ?? e.item?.name ?? "")) awaiting = true;
+    }
+    if (thread.id) writeFileSync(threadFile, thread.id);   // persist for resume
+    writeLine(res, { kind: "done", reason: awaiting ? "awaiting_input" : "quiescent" });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    writeLine(res, { kind: "done", reason: "error", error: { type: ac.signal.aborted ? "aborted" : "turn_failed", message } });
+  } finally {
+    busy = false;
+    if (!res.writableEnded) res.end();
+  }
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((err) => {
-    if (err?.message === "fenced") process.exit(0); // canceled/superseded — the platform decides
-    console.error("[codex runtime] turn failed:", err);
-    process.exit(1); // crash — the platform restarts the turn
-  });
+const server = createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/healthz") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ready", contract_version: CONTRACT_VERSION, busy }));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/turn") { void runTurn(req, res); return; }
+  res.writeHead(404); res.end();
+});
+
+server.listen(PORT, "127.0.0.1", () => console.error(`[codex brain] listening on 127.0.0.1:${PORT} (contract ${CONTRACT_VERSION})`));

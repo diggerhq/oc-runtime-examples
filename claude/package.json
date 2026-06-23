@@ -3,16 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Example OpenComputer runtime: a Claude Agent SDK wrapper conforming to the runtime contract.",
-  "bin": { "oc-runtime-claude": "dist/index.js" },
+  "description": "Example OpenComputer runtime brain: a Claude Agent SDK server.",
+  "bin": { "oc-runtime-claude-brain": "dist/index.js" },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.177",
-    "zod": "^4.0.0"
+    "@anthropic-ai/claude-agent-sdk": "^0.3.177"
   },
   "devDependencies": {
     "@types/node": "^20",

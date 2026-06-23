@@ -1,68 +1,138 @@
 # OpenComputer runtime examples
 
-A **runtime** is the engine that runs an OpenComputer [Durable Agent Session](https://docs.opencomputer.dev/agent-sessions/runtimes): a replaceable "brain" that drives a model's agent loop for one turn. A runtime knows two things and nothing else — **a provider's agent SDK** (the model loop) and the **OpenComputer operational contract** (a handful of HTTP calls + env vars + an exit code). It does **not** import any OpenComputer library; a brain in any language implements the same contract.
+These examples mirror how the built-in **`claude`** and **`codex`** runtimes are actually
+built: an OC-unaware **brain server** around an agent SDK. They're trimmed for clarity, but
+the contract and the SDK wiring match production.
 
-Two worked examples, each a single file:
+A **runtime** is what's often called an **agent harness** — the terms map 1:1; OpenComputer's
+API just calls it `runtime`.
 
-- [**`claude/src/index.ts`**](claude/src/index.ts) — wraps the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`).
-- [**`codex/src/index.ts`**](codex/src/index.ts) — wraps the OpenAI Codex SDK (`@openai/codex-sdk`).
+The runtime author writes the brain. OpenComputer provides the platform **adapter**. The
+adapter reads the session log, owns fencing and idempotency, exposes the sandbox tools over
+MCP, calls the brain over localhost, and commits the brain's stream back to the session as
+durable events.
 
-Each file reads the same way: the operational contract (the only platform dependency), the agent's tools, then the turn. The contract section is byte-identical across both — it doesn't depend on the model. The only real difference is the provider SDK.
+That split is the point of this repo: the brain is just your agent harness; OpenComputer's
+mechanics live in the adapter. The brain imports no OpenComputer SDK and never calls the
+events or sandbox APIs directly.
 
-## The operational contract
+## Examples
 
-This is the whole interface between a runtime and the platform.
+- [`claude/src/index.ts`](claude/src/index.ts) wraps the Claude Agent SDK.
+- [`codex/src/index.ts`](codex/src/index.ts) wraps the OpenAI Codex SDK.
 
-### Invocation — once per turn
+Both are a single HTTP server (`GET /healthz`, `POST /turn`) that drives the SDK for one
+turn and streams the SDK's native output. The interesting differences are in how each SDK is
+pointed at the MCP tools and how each resumes — see the comments in each file.
 
-The platform runs the runtime **once per turn** (`node dist/index.js`): the process drives a single turn and exits. It is not a long-running server.
+## Runtime–platform contract
 
-### Inputs — the environment
+### Process
 
-Everything the runtime needs arrives in the environment:
+The runtime image starts a long-running HTTP server in the brain sandbox. OpenComputer calls
+it from a local adapter over `127.0.0.1:$OC_BRAIN_PORT` (`8080` by default). The server is
+resident — it stays warm across turns and across sandbox hibernate/wake — and handles one
+turn at a time.
 
-| Variable | Meaning |
+### Health
+
+```http
+GET /healthz
+```
+
+```json
+{ "status": "ready", "contract_version": "1", "busy": false }
+```
+
+Return `busy: true` while a turn is in progress. A second `POST /turn` should return `409`;
+the platform fence already serializes real turns, so this is a safety check.
+
+> `contract_version` is the internal runtime↔adapter version (`"1"` today). The public
+> custom-runtime contract is still being finalized and may differ when it ships.
+
+### Turn request
+
+```http
+POST /turn
+Content-Type: application/json
+```
+
+```json
+{
+  "contract_version": "1",
+  "turn_id": "turn_...",
+  "input": [{ "role": "user", "content": "Review this repository." }],
+  "config": {
+    "model": "anthropic/claude-opus-4-8",
+    "system_prompt": "Run tests and explain risks.",
+    "mcp_endpoint": "http://127.0.0.1:8765/mcp",
+    "state_dir": "/home/sandbox/.oc/runtime-state"
+  },
+  "deadline_s": 600
+}
+```
+
+The adapter has already read the durable session log and reduced it to the new turn input.
+The brain does not know session ids, event cursors, turn tokens, or OpenComputer event names.
+
+### Step stream
+
+`POST /turn` responds with newline-delimited JSON. The brain streams the SDK's **native**
+events verbatim, one per line, then a terminal `done`:
+
+```jsonl
+{"seq":0,"kind":"assistant","msg":{ ...native SDK message... }}
+{"seq":1,"kind":"user","msg":{ ...native SDK message (e.g. a tool result)... }}
+{"kind":"done","reason":"quiescent"}
+```
+
+- `kind` is the SDK message/event type; `msg` is the native object unchanged.
+- `done.reason` is `quiescent` (nothing left to do), `awaiting_input` (the agent called
+  `ask` and is paused for a reply), or `error` (with an `error`).
+
+The platform adapter is what knows each SDK's shape: it maps these native events to session
+events with stable idempotency keys, and flushes committed events before ending the turn.
+(A single SDK-agnostic step protocol for fully custom runtimes is planned; today the platform
+ships a per-SDK adapter for each built-in.)
+
+### Tools
+
+The brain acts through the MCP server at `config.mcp_endpoint` — and **only** that. Each SDK
+is wired to use it and to disable its own built-in local tools, so commands and files run in
+the hands sandbox, not in the brain box:
+
+| Tool | What it does |
 | --- | --- |
-| `OC_API_URL` | Base URL of the session API. |
-| `OC_SESSION_ID` | The session this turn belongs to. |
-| `OC_TURN_ID` | This turn's id (used to build idempotent append keys). |
-| `OC_TURN_TOKEN` | Fenced, single-use auth for this turn (sent as `X-Turn-Token`) — the only plaintext credential the runtime holds. |
-| `OC_EVENTS_CURSOR` | Read watermark: events at or before this seq are already consumed. |
-| `OC_EVENT_KEY_BASE` | Durable high-water seed for append idempotency keys. |
-| `OC_AGENT_PROMPT` | The agent's system prompt. |
-| `OC_MODEL` | The `provider/model` to run. |
-| `OC_RUNTIME_STATE_DIR` | A checkpointed directory for resumable state. |
-| `<PROVIDER>_API_KEY` | The model key, **sealed**: an opaque token the host egress proxy swaps for the real key on the outbound call to the provider. It never enters the VM in plaintext. |
+| `bash` | Run a shell command in the hands sandbox. |
+| `read` / `write` / `ls` | File access in the hands sandbox. |
+| `say` | Emit a user-visible message. |
+| `ask` | Ask for input and pause the turn. |
 
-### The turn — three HTTP calls
+The Claude SDK takes the MCP server as an HTTP `mcpServers` entry (with the built-in tools
+disallowed). The Codex SDK takes it via CLI **config** (`mcp_servers.<name>.url`) with its
+native shell disabled (`features.shell_tool`/`unified_exec` off) — see the codex example for
+why HTTP transport and the sandbox/approval flags are required.
 
-1. **Read new input** — `GET /v3/sessions/:id/events?after=<cursor>&level=internal`.
-2. **Append events** — `POST /v3/sessions/:id/events` with `{ type, level, body, idempotency_key }`. Types: `agent.message`, `tool.call`, `exec.completed`, `error.*`. The stable idempotency key (`rt:<turn>:<base+n>`) makes a restart safe to replay.
-3. **Act in the remote sandbox** — `POST /v3/sessions/:id/sandbox/{exec,read,write,ls}`. The runtime has no local disk, shell, or network of its own.
+### State and recovery
 
-All authenticated by `X-Turn-Token`. Talking to the human is just an append at `level: "user"` (`say`), or one with `awaiting_input: true` (`ask`, which pauses the turn).
+Anything required to resume goes under `config.state_dir`. OpenComputer checkpoints that
+directory at turn boundaries and restores it after recovery:
 
-### Event levels
+- **Claude** keeps a local journal under `state_dir` and continues from it.
+- **Codex** persists its server-side `thread.id` under `state_dir` and resumes that thread.
 
-Every event has a `level`: `user` (shown to the human), `progress` (activity feed), or `internal` (operator/debug).
+Make the stream replay-safe: after a crash the adapter may re-run the turn and deduplicate
+already-committed events.
 
-### Output — the exit code is the lifecycle
+### Cancellation
 
-- **Exit 0** — quiescent: nothing left to do. The session goes idle until the next message.
-- **Non-zero** — crash: the platform restarts the turn in place from the checkpointed state.
-- A **`401`** on append means the turn was **fenced** (canceled, or superseded by a newer one). Stop quietly and exit 0; the platform owns what's next. Fencing guarantees a single writer, so the log never forks.
-
-### Resumable state
-
-Anything needed to resume goes under `OC_RUNTIME_STATE_DIR`, which the platform checkpoints at each turn boundary and restores on recovery. Its shape is up to the SDK: `claude` keeps a journal it `--continue`s; `codex` persists a server-side thread id it `resumeThread()`s.
-
-### What the platform owns
-
-The durable event log, single-writer fencing, hibernation, crash/restart, recovery, and delivery. The runtime stays stateless between turns except for `OC_RUNTIME_STATE_DIR`.
+If a turn is canceled or superseded, the adapter aborts the HTTP request; the brain stops the
+SDK loop when the request closes. If it doesn't, the adapter kills and restarts the brain
+before the next turn.
 
 ## Build
 
-Each runtime is a standalone package:
+Each example is a standalone package:
 
 ```bash
 cd claude   # or codex
@@ -71,6 +141,11 @@ npm run build
 npm start
 ```
 
+The server listens on `OC_BRAIN_PORT` or `8080`.
+
 ## Status
 
-These are reference implementations of the contract. Registering your own custom runtime image is on the OpenComputer roadmap — see [Custom runtimes](https://docs.opencomputer.dev/agent-sessions/custom-runtimes). The `claude` example tracks the production `claude` runtime closely; in `codex`, the tool-registration call and the streamed-item field names are the two spots that converge with the production `codex` runtime (marked in the file).
+Custom-runtime registration is planned, not yet public. These examples are close to the
+production built-ins (provider SDK in the brain, OpenComputer mechanics in the adapter) so
+you can see the real shape today; the public author-facing contract will be published when
+custom runtimes ship.
