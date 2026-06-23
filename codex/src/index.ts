@@ -33,7 +33,7 @@ interface TurnConfig {
   system_prompt?: string;
   mcp_endpoint?: string;   // external MCP server (adapter-hosted): the hands + say/ask
   state_dir?: string;      // checkpointed dir; the codex thread id lives under it
-  deadline_s?: number;
+  resume?: boolean;        // ignored — codex resumes via the persisted thread id, not a flag
 }
 interface TurnRequest {
   contract_version?: string;
@@ -55,12 +55,14 @@ function writeLine(res: ServerResponse, obj: unknown): void {
 
 async function runTurn(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (busy) { res.writeHead(409, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { type: "busy", message: "a turn is in flight" } })); return; }
+  busy = true;   // claim NOW — no await between the guard and the claim, so two POSTs can't both pass.
 
   let body: TurnRequest;
   try { body = await readBody(req); }
-  catch { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { type: "invalid", message: "bad JSON" } })); return; }
+  catch { busy = false; res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { type: "invalid", message: "bad JSON" } })); return; }
 
   if (body.contract_version && body.contract_version !== CONTRACT_VERSION) {
+    busy = false;
     res.writeHead(426, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: { type: "version", message: `brain speaks contract ${CONTRACT_VERSION}` } }));
     return;
@@ -80,7 +82,6 @@ async function runTurn(req: IncomingMessage, res: ServerResponse): Promise<void>
   ].filter(Boolean).join("\n\n");
 
   res.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-cache" });
-  busy = true;
   let seq = 0;
   let awaiting = false;
   const ac = new AbortController();

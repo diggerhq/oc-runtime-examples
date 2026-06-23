@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@openai/codex-sdk": "^0.142.0"
+    "@openai/codex-sdk": "0.142.0"
   },
   "devDependencies": {
     "@types/node": "^20",
