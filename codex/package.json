@@ -3,15 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Example OpenComputer runtime: an OpenAI Codex SDK wrapper conforming to the runtime contract.",
-  "bin": { "oc-runtime-codex": "dist/index.js" },
+  "description": "Example OpenComputer runtime brain: an OpenAI Codex SDK server.",
+  "bin": { "oc-runtime-codex-brain": "dist/index.js" },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@openai/codex-sdk": "^0.45.0"
+    "@openai/codex-sdk": "0.142.0"
   },
   "devDependencies": {
     "@types/node": "^20",
